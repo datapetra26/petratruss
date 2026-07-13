@@ -950,33 +950,54 @@ const DEFAULT_DB = {
   suratArsipDok:[],
   suratCounter:{penawaran:0,spk:0}
 };
-let DB = loadDB();
-function loadDB(){
+// ===== PENYIMPANAN UTAMA: INDEXEDDB =====
+// localStorage cuma muat ±5 MB, gampang penuh karena banyak foto.
+// IndexedDB jatahnya RATUSAN MB, tetap offline & permanen di HP.
+// Data lama di localStorage otomatis dipindah sekali, nggak ada yang hilang.
+const IDB_NAME='petra_truss_idb', IDB_STORE='kv';
+function idbOpen(){ return new Promise((res,rej)=>{ const r=indexedDB.open(IDB_NAME,1); r.onupgradeneeded=()=>r.result.createObjectStore(IDB_STORE); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); }); }
+function idbGet(k){ return idbOpen().then(db=>new Promise((res,rej)=>{ const t=db.transaction(IDB_STORE).objectStore(IDB_STORE).get(k); t.onsuccess=()=>res(t.result); t.onerror=()=>rej(t.error); })); }
+function idbSet(k,v){ return idbOpen().then(db=>new Promise((res,rej)=>{ const t=db.transaction(IDB_STORE,'readwrite').objectStore(IDB_STORE).put(v,k); t.onsuccess=()=>res(); t.onerror=()=>rej(t.error); })); }
+
+let DB = null; // diisi lewat await loadDB() di init()
+async function loadDB(){
   try{
-    const raw=localStorage.getItem(DB_KEY);
+    let raw = await idbGet('db').catch(()=>null);
+    if(!raw) raw = localStorage.getItem(DB_KEY); // migrasi 1x dari versi lama
     if(!raw){
       const d=JSON.parse(JSON.stringify(INITIAL_DATA));
-      localStorage.setItem(DB_KEY,JSON.stringify(d));
+      await idbSet('db',JSON.stringify(d)).catch(()=>{});
       return d;
     }
     const saved=JSON.parse(raw);
     const merged=Object.assign(JSON.parse(JSON.stringify(INITIAL_DATA)),saved);
-    // Selalu pakai users dari INITIAL_DATA agar login selalu bisa
-    merged.users=INITIAL_DATA.users;
-    // PENTING: hutang/piutang/arsip HANYA dipakai dari data tersimpan (localStorage).
-    // Sebelumnya baris ini menimpa data Bos setiap kali app dibuka — sudah diperbaiki.
+    // FIX: PIN yang Bos ganti sekarang TERSIMPAN (dulu ketimpa PIN awal tiap buka app)
+    if(Array.isArray(saved.users)&&saved.users.length>=2&&saved.users.every(u=>u&&typeof u.pin==='string'&&u.pin.length)){
+      merged.users=saved.users;
+    }else{
+      merged.users=INITIAL_DATA.users;
+    }
     if(!Array.isArray(saved.hutang)) merged.hutang=INITIAL_DATA.hutang;
     if(!Array.isArray(saved.piutang)) merged.piutang=INITIAL_DATA.piutang;
     if(!Array.isArray(saved.arsip)) merged.arsip=[];
-    if((saved.proyek||[]).length<INITIAL_DATA.proyek.length) merged.proyek=INITIAL_DATA.proyek;
-    if(!(saved.material||[]).length) merged.material=INITIAL_DATA.material;
+    // FIX: dulu kalau proyek Bos LEBIH SEDIKIT dari data awal (misal abis dihapus), SEMUA proyek ketimpa balik ke data awal.
+    // Sekarang cuma dipakai data awal kalau memang belum ada / datanya rusak.
+    if(!Array.isArray(saved.proyek)) merged.proyek=INITIAL_DATA.proyek;
+    if(!Array.isArray(saved.material)||!saved.material.length) merged.material=INITIAL_DATA.material;
+    await idbSet('db',JSON.stringify(merged)).catch(()=>{});
     return merged;
   }catch(e){
     return JSON.parse(JSON.stringify(INITIAL_DATA));
   }
 }
 
-function save(){ localStorage.setItem(DB_KEY, JSON.stringify(DB)); }
+function save(){
+  const data = JSON.stringify(DB);
+  idbSet('db', data).catch(()=>{
+    alert('⚠️ Data GAGAL disimpan ke memori HP!\n\nKemungkinan memori HP penuh. Segera:\n1. Backup (Pengaturan > Backup)\n2. Kosongkan memori HP\n3. Coba simpan lagi');
+  });
+  try{ localStorage.setItem(DB_KEY, data); }catch(e){} // cadangan, biarin aja kalau ini penuh
+}
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
 function rp(n){ if(n==null||isNaN(n)) return 'Rp 0'; return 'Rp '+Math.round(Number(n)).toLocaleString('id-ID'); }
 function rpShort(n){ n=Number(n)||0; if(Math.abs(n)>=1e9)return 'Rp '+(n/1e9).toFixed(1)+'M'; if(Math.abs(n)>=1e6)return 'Rp '+(n/1e6).toFixed(1)+'jt'; if(Math.abs(n)>=1e3)return 'Rp '+(n/1e3).toFixed(0)+'rb'; return rp(n); }
@@ -3902,11 +3923,16 @@ function renderPengaturan(){
       <button class="btn btn-p" onclick="simpanPin()">Simpan PIN</button>
     </div></div>
 
+    <div class="card"><div class="card-h"><div class="card-t">📊 Pemakaian Memori</div></div><div class="card-b" id="storage-info">
+      <div class="note">Menghitung...</div>
+    </div></div>
+
     <div class="card"><div class="card-b">
       <button class="btn" style="background:var(--red-s);color:var(--red)" onclick="resetData()">🗑️ Hapus Semua Data</button>
       <div class="note">Backup dulu sebelum hapus! Aksi ini tidak bisa dibatalkan.</div>
     </div></div>
   `;
+  renderStorageInfo();
 }
 function simpanPct(){
   const m=parseInt(document.getElementById('set-modal').value)||0;
@@ -3920,6 +3946,28 @@ function simpanPin(){
   DB.users[1].pin=document.getElementById('pin2').value.trim()||'1234';
   save(); alert('✅ PIN disimpan');
 }
+// ===== INDIKATOR PEMAKAIAN MEMORI =====
+function fmtByte(b){ b=Number(b)||0; if(b>=1073741824)return (b/1073741824).toFixed(2)+' GB'; if(b>=1048576)return (b/1048576).toFixed(1)+' MB'; return Math.round(b/1024)+' KB'; }
+async function renderStorageInfo(){
+  const el=document.getElementById('storage-info'); if(!el)return;
+  const dbSize=new Blob([JSON.stringify(DB)]).size;
+  let fotoCount=0, fotoSize=0;
+  (DB.proyek||[]).forEach(p=>(p.foto||[]).forEach(f=>{ fotoCount++; fotoSize+=(f.src||'').length; }));
+  let html='<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line)"><span>Ukuran database</span><b>'+fmtByte(dbSize)+'</b></div>';
+  html+='<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line)"><span>Foto proyek</span><b>'+fotoCount+' foto ('+fmtByte(fotoSize)+')</b></div>';
+  if(navigator.storage && navigator.storage.estimate){
+    try{
+      const est=await navigator.storage.estimate();
+      const pct=est.quota?Math.min(100,Math.round(est.usage/est.quota*100)):0;
+      const warna=pct>=80?'var(--red)':(pct>=60?'#f59e0b':'#22c55e');
+      html+='<div style="display:flex;justify-content:space-between;padding:6px 0"><span>Jatah dari browser</span><b>'+fmtByte(est.usage)+' / '+fmtByte(est.quota)+' ('+pct+'%)</b></div>';
+      html+='<div style="height:10px;background:var(--line);border-radius:5px;overflow:hidden;margin-top:4px"><div style="height:100%;width:'+Math.max(pct,2)+'%;background:'+warna+';border-radius:5px"></div></div>';
+      if(pct>=80) html+='<div class="banner" style="margin-top:10px"><span class="bic">⚠️</span><span>Memori hampir penuh! Backup sekarang, upload ke Google Drive, lalu hapus foto proyek lama yang sudah Selesai.</span></div>';
+      else html+='<div class="note" style="margin-top:8px">Data tersimpan permanen di HP (IndexedDB). Tetap rutin Backup + upload ke Google Drive buat jaga-jaga HP hilang/rusak.</div>';
+    }catch(e){}
+  }
+  el.innerHTML=html;
+}
 function resetData(){
   admConfirm('⚠️ Hapus SEMUA Data?','Hapus SEMUA data? Pastikan sudah backup!',()=>{
     admConfirm('⚠️ Yakin Betul?','Yakin betul? Semua proyek, material, keuangan akan hilang.',()=>{
@@ -3929,7 +3977,10 @@ function resetData(){
 }
 
 // ===== INIT =====
-(function init(){
+(async function init(){
+  DB = await loadDB(); // WAJIB ditunggu - DB masih null sebelum ini selesai
+  // Minta browser jadikan penyimpanan permanen, nggak dihapus otomatis pas memori HP menipis
+  if(navigator.storage && navigator.storage.persist){ navigator.storage.persist().catch(()=>{}); }
   // Daftarin service worker (kalau dibuka via https, misal GitHub Pages) — bikin ikon HP jadi app asli, bukan shortcut
   if('serviceWorker' in navigator && (location.protocol==='https:'||location.hostname==='localhost')){
     navigator.serviceWorker.register('sw.js').catch(()=>{}); // gagal diem-diem aja kalau nggak ketemu filenya, nggak ganggu aplikasi
